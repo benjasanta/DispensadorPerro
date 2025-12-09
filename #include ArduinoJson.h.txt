@@ -1,0 +1,295 @@
+#include <ArduinoJson.h>
+#include <CTBot.h>
+#include <ESP32Servo.h>
+#include "HX711.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// ====== TELEGRAM ======
+CTBot miBot;
+CTBotReplyKeyboard teclado;
+
+#define miBotToken "8548400621:AAHjFe_92l27TBAMRqcN6bF_DQLa6bMp-3g"
+#define ChatID 8133156540
+
+// ====== WIFI ======
+const char* ssid     = "K!!";
+const char* password = "olabuenas";
+
+// Servidor XAMPP
+const char* SERVER_URL = "http://10.246.26.136/dispensador/registrar.php";
+
+// Archivos PHP
+const char* PANEL_URL = "http://10.246.26.136/dispensador/panel.php";
+
+// ====== SERVO ======
+Servo miservo;
+static const int ServoPin = 13;
+#define SERVO_ABRE   50
+#define SERVO_CIERRA 0
+
+// ====== HX711 ======
+#define HX_DOUT 14
+#define HX_SCK  27
+HX711 scale;
+
+// ====== CONFIG GENERAL ======
+float factorCalibracion = -50.0;
+float pesoObjetivo      = 0;
+float tolerancia        = 3.0;
+
+bool tipoElegido        = false;
+String tipoSeleccionado = "";
+bool esperandoCantidad  = false;
+
+bool dispensando        = false;
+float pesoInicial       = 0;
+bool balanzaOK          = false;
+
+// RANGOS DE DOSIS
+int minCachorro = 10, maxCachorro = 40;
+int minMediano  = 50, maxMediano  = 80;
+int minGrande   = 90, maxGrande   = 150;
+
+// ========================================================
+// FUNCIONES
+// ========================================================
+
+float leerPeso() {
+  if (!scale.is_ready()) return NAN;
+  return scale.get_units(10);
+}
+
+bool testBalanza() {
+  if (!scale.is_ready()) return false;
+  float p = scale.get_units(3);
+  return (!isnan(p) && !isinf(p));
+}
+
+void enviarRegistro(String tipo, float solicitada, float real) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Sin WiFi, no se envía registro");
+    return;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+
+  if (!http.begin(client, SERVER_URL)) {
+    Serial.println("Fallo http.begin");
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String body = "tipo=" + tipo +
+                "&cantidadSolicitada=" + String(solicitada, 1) +
+                "&cantidadReal=" + String(real, 1);
+
+  int code = http.POST(body);
+  Serial.print("HTTP: ");
+  Serial.println(code);
+
+  if (code > 0) Serial.println(http.getString());
+
+  http.end();
+}
+
+// ========================================================
+// SETUP
+// ========================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  miservo.attach(ServoPin);
+  miservo.write(SERVO_CIERRA);
+
+  scale.begin(HX_DOUT, HX_SCK);
+  delay(300);
+  scale.set_scale(factorCalibracion);
+  scale.tare();
+  delay(300);
+
+  balanzaOK = testBalanza();
+
+  // WIFI
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(200);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi OK");
+
+  // TELEGRAM BOT
+  miBot.setTelegramToken(miBotToken);
+
+  teclado.addButton("CACHORRO");
+  teclado.addButton("MEDIANO");
+  teclado.addButton("GRANDE");
+  teclado.addButton("ALIMENTAR");
+  teclado.addButton("PANEL");    // ← NUEVO
+  teclado.enableResize();
+
+  miBot.sendMessage(ChatID, "Seleccione tipo de perro:", teclado);
+}
+
+// ========================================================
+// LOOP
+// ========================================================
+void loop() {
+
+  TBMessage mensaje;
+
+  if (CTBotMessageText == miBot.getNewMessage(mensaje)) {
+
+    String txt = mensaje.text;
+
+    // =====================================================
+    // PANEL.PHP (ABRIR PANEL)
+    // =====================================================
+    if (txt == "PANEL") {
+
+      miBot.sendMessage(
+        ChatID,
+        "Panel disponible en:\n" + String(PANEL_URL)
+      );
+
+      return;
+    }
+
+
+    // =====================================================
+    // SELECCIÓN DE TIPO
+    // =====================================================
+    if (txt == "CACHORRO") {
+      tipoElegido = true;
+      tipoSeleccionado = "CACHORRO";
+      esperandoCantidad = true;
+      miBot.sendMessage(ChatID,
+        "CACHORRO seleccionado.\nIngrese entre 10 y 40 g.");
+      return;
+    }
+
+    if (txt == "MEDIANO") {
+      tipoElegido = true;
+      tipoSeleccionado = "MEDIANO";
+      esperandoCantidad = true;
+      miBot.sendMessage(ChatID,
+        "MEDIANO seleccionado.\nIngrese entre 50 y 80 g.");
+      return;
+    }
+
+    if (txt == "GRANDE") {
+      tipoElegido = true;
+      tipoSeleccionado = "GRANDE";
+      esperandoCantidad = true;
+      miBot.sendMessage(ChatID,
+        "GRANDE seleccionado.\nIngrese entre 90 y 150 g.");
+      return;
+    }
+
+    // =====================================================
+    // LECTURA DE CANTIDAD
+    // =====================================================
+    if (esperandoCantidad) {
+
+      int valor = txt.toInt();
+      if (valor <= 0) {
+        miBot.sendMessage(ChatID, "Ingrese un número válido.");
+        return;
+      }
+
+      if (tipoSeleccionado == "CACHORRO" &&
+         (valor < minCachorro || valor > maxCachorro)) {
+        miBot.sendMessage(ChatID, "Debe estar entre 10 y 40 g.");
+        return;
+      }
+
+      if (tipoSeleccionado == "MEDIANO" &&
+         (valor < minMediano || valor > maxMediano)) {
+        miBot.sendMessage(ChatID, "Debe estar entre 50 y 80 g.");
+        return;
+      }
+
+      if (tipoSeleccionado == "GRANDE" &&
+         (valor < minGrande || valor > maxGrande)) {
+        miBot.sendMessage(ChatID, "Debe estar entre 90 y 150 g.");
+        return;
+      }
+
+      pesoObjetivo = valor;
+      esperandoCantidad = false;
+
+      miBot.sendMessage(
+        ChatID,
+        "Cantidad aceptada: " + String(pesoObjetivo) + " g.\nPulse ALIMENTAR."
+      );
+
+      return;
+    }
+
+    // =====================================================
+    // ALIMENTAR
+    // =====================================================
+    if (txt == "ALIMENTAR") {
+
+      if (!tipoElegido) {
+        miBot.sendMessage(ChatID, "Seleccione tipo antes.");
+        return;
+      }
+
+      if (esperandoCantidad) {
+        miBot.sendMessage(ChatID, "Falta ingresar la cantidad.");
+        return;
+      }
+
+      if (!balanzaOK) {
+        miBot.sendMessage(ChatID, "ERROR: balanza no detectada.");
+        return;
+      }
+
+      miBot.sendMessage(ChatID,
+        "Alimentando " + tipoSeleccionado +
+        " → " + String(pesoObjetivo) + " g");
+
+      pesoInicial = leerPeso();
+      dispensando = true;
+      miservo.write(SERVO_ABRE);
+
+      return;
+    }
+  }
+
+  // =====================================================
+  // DISPENSANDO
+  // =====================================================
+  if (dispensando) {
+
+    float pesoActual = leerPeso();
+    if (isnan(pesoActual)) return;
+
+    float entregado = pesoActual - pesoInicial;
+
+    miBot.sendMessage(
+      ChatID,
+      "Actual: " + String(pesoActual) + " g | Entregado: " + String(entregado) + " g"
+    );
+
+    if (entregado >= (pesoObjetivo - tolerancia)) {
+
+      miservo.write(SERVO_CIERRA);
+      dispensando = false;
+
+      String reporte =
+        "Entregado: " + String(entregado, 1) + " g\n" +
+        ((entregado <= pesoObjetivo + tolerancia) ? "PESO OK" : "SOBREPASO");
+
+      miBot.sendMessage(ChatID, reporte);
+
+      enviarRegistro(tipoSeleccionado, pesoObjetivo, entregado);
+    }
+
+    delay(350);
+  }
+}
